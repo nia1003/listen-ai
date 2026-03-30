@@ -1,12 +1,31 @@
 import os
 import re
 from collections import Counter
+from pathlib import Path
 
+import joblib
 from fastapi import FastAPI
 from pydantic import BaseModel
 
 app = FastAPI(title="listen-ai-nlp")
 
+# ─────────────────────────────────────────────────────────────
+# Try to load the trained TF-IDF + LogReg model at startup
+# ─────────────────────────────────────────────────────────────
+_MODEL_PATH = Path(__file__).parent / "model.pkl"
+_model = None
+_model_loaded = False
+
+try:
+    _model = joblib.load(_MODEL_PATH)
+    _model_loaded = True
+    print(f"[nlp] Loaded ML model from {_MODEL_PATH}")
+except Exception as exc:
+    print(f"[nlp] Model not found or failed to load ({exc}); using lexicon fallback")
+
+# ─────────────────────────────────────────────────────────────
+# Lexicon-based fallback (original method)
+# ─────────────────────────────────────────────────────────────
 POSITIVE_WORDS = {
     "good",
     "great",
@@ -133,7 +152,8 @@ def tokenize(text: str) -> list[str]:
     return tokens
 
 
-def classify_text(text: str) -> tuple[str, int]:
+def classify_lexicon(text: str) -> tuple[str, int]:
+    """Original lexicon-based classifier (fallback)."""
     tokens = tokenize(text)
     score = 0
     previous_tokens = ["", ""]
@@ -155,6 +175,19 @@ def classify_text(text: str) -> tuple[str, int]:
     return "neutral", score
 
 
+def classify_text(text: str) -> tuple[str, int]:
+    """Classify using the ML model if available, else lexicon fallback."""
+    if _model_loaded and _model is not None:
+        label = _model.predict([text])[0]
+        # score is not meaningful for ML model; use 1/-1/0 as proxy
+        score_map = {"positive": 1, "neutral": 0, "negative": -1}
+        return label, score_map.get(label, 0)
+    return classify_lexicon(text)
+
+
+# ─────────────────────────────────────────────────────────────
+# API schemas
+# ─────────────────────────────────────────────────────────────
 class SentimentRequest(BaseModel):
     texts: list[str]
 
@@ -170,9 +203,39 @@ class SentimentResponse(BaseModel):
     classifications: list[SentimentItem]
 
 
+class ModelInfoResponse(BaseModel):
+    method: str
+    model_path: str
+    model_loaded: bool
+    model_classes: list[str] | None
+
+
+# ─────────────────────────────────────────────────────────────
+# Routes
+# ─────────────────────────────────────────────────────────────
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "service": "nlp", "port": os.getenv("NLP_PORT", "8001")}
+
+
+@app.get("/model_info", response_model=ModelInfoResponse)
+def model_info() -> ModelInfoResponse:
+    """Return which classification method is active and basic stats."""
+    if _model_loaded and _model is not None:
+        clf = _model.named_steps.get("clf") if hasattr(_model, "named_steps") else _model
+        classes = list(clf.classes_) if hasattr(clf, "classes_") else None
+        return ModelInfoResponse(
+            method="tfidf_logreg",
+            model_path=str(_MODEL_PATH),
+            model_loaded=True,
+            model_classes=classes,
+        )
+    return ModelInfoResponse(
+        method="lexicon_fallback",
+        model_path=str(_MODEL_PATH),
+        model_loaded=False,
+        model_classes=None,
+    )
 
 
 @app.post("/sentiment", response_model=SentimentResponse)
