@@ -70,21 +70,37 @@ app.post("/api/dashboard", authMiddleware, async (req, res) => {
 
     const stats = statResp.data;
     const posts = Array.isArray(stats.posts) ? stats.posts : [];
-    const texts = posts.map((p) => p.content);
 
-    const sentimentResp = await axios.post(`${nlpUrl}/sentiment`, { texts });
-    const sentimentData = sentimentResp.data;
+    let sentimentPercentage;
+    let classifiedPosts;
 
-    const classifiedPosts = posts.map((post, idx) => ({
-      ...post,
-      sentiment: sentimentData.classifications?.[idx]?.label || "neutral",
-      sentiment_score: sentimentData.classifications?.[idx]?.score || 0,
-    }));
+    // Use precomputed sentiment from stat service if all posts have cached values
+    if (stats.sentiment_precomputed && stats.sentiment_percentage) {
+      sentimentPercentage = stats.sentiment_percentage;
+      // Posts already have sentiment field from stat service
+      classifiedPosts = posts.map((post) => ({
+        ...post,
+        sentiment: post.sentiment || "neutral",
+        sentiment_score: post.sentiment === "positive" ? 1 : post.sentiment === "negative" ? -1 : 0,
+      }));
+    } else {
+      // Fall back to calling NLP service
+      const texts = posts.map((p) => p.content);
+      const sentimentResp = await axios.post(`${nlpUrl}/sentiment`, { texts }, { timeout: 30000 });
+      const sentimentData = sentimentResp.data;
+
+      sentimentPercentage = sentimentData.sentiment_percentage;
+      classifiedPosts = posts.map((post, idx) => ({
+        ...post,
+        sentiment: sentimentData.classifications?.[idx]?.label || "neutral",
+        sentiment_score: sentimentData.classifications?.[idx]?.score || 0,
+      }));
+    }
 
     const examples = classifiedPosts.slice(0, sampleSize);
 
     return res.json({
-      sentimentPercentage: sentimentData.sentiment_percentage,
+      sentimentPercentage,
       topKeywords: stats.top_keywords || [],
       trends: stats.trends || [],
       examplePosts: examples,
@@ -104,12 +120,32 @@ app.post("/api/posts", authMiddleware, async (req, res) => {
   const { platform = "", author = "", content = "", createdAt = "" } = req.body || {};
 
   try {
-    const statResp = await axios.post(`${statUrl}/posts`, {
-      platform,
-      author,
-      content,
-      created_at: createdAt,
-    });
+    // 1. Get sentiment from NLP service
+    let sentiment = null;
+    try {
+      const nlpResp = await axios.post(
+        `${nlpUrl}/sentiment`,
+        { texts: [content] },
+        { timeout: 5000 }
+      );
+      sentiment = nlpResp.data.classifications?.[0]?.label || null;
+    } catch (nlpErr) {
+      // Non-fatal: insert without sentiment if NLP is unavailable
+      console.warn("NLP service unavailable for /api/posts:", nlpErr.message);
+    }
+
+    // 2. Insert to stat service with sentiment
+    const statResp = await axios.post(
+      `${statUrl}/posts`,
+      {
+        platform,
+        author,
+        content,
+        created_at: createdAt,
+        sentiment,
+      },
+      { timeout: 10000 }
+    );
     return res.status(201).json(statResp.data);
   } catch (err) {
     const status = err.response?.status || 500;

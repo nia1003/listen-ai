@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"regexp"
@@ -22,6 +23,7 @@ type Post struct {
 	Author    string `json:"author"`
 	Content   string `json:"content"`
 	CreatedAt string `json:"created_at"`
+	Sentiment string `json:"sentiment,omitempty"`
 }
 
 type StatsRequest struct {
@@ -44,11 +46,13 @@ type TrendPoint struct {
 }
 
 type StatsResponse struct {
-	MentionCount int            `json:"mention_count"`
-	TopKeywords  []KeywordCount `json:"top_keywords"`
-	Trends       []TrendPoint   `json:"trends"`
-	ExamplePosts []Post         `json:"example_posts"`
-	Posts        []Post         `json:"posts"`
+	MentionCount         int                `json:"mention_count"`
+	TopKeywords          []KeywordCount     `json:"top_keywords"`
+	Trends               []TrendPoint       `json:"trends"`
+	ExamplePosts         []Post             `json:"example_posts"`
+	Posts                []Post             `json:"posts"`
+	SentimentPrecomputed bool               `json:"sentiment_precomputed"`
+	SentimentPercentage  map[string]float64 `json:"sentiment_percentage,omitempty"`
 }
 
 type InsertPostRequest struct {
@@ -56,6 +60,7 @@ type InsertPostRequest struct {
 	Author    string `json:"author"`
 	Content   string `json:"content"`
 	CreatedAt string `json:"created_at"`
+	Sentiment string `json:"sentiment"`
 }
 
 type InsertPostResponse struct {
@@ -72,21 +77,18 @@ var stopWords = map[string]bool{
 func parseDateRange(fromDate, toDate string) (string, string, error) {
 	layout := "2006-01-02"
 	now := time.Now()
-
 	if fromDate == "" {
 		fromDate = now.AddDate(0, 0, -30).Format(layout)
 	}
 	if toDate == "" {
 		toDate = now.Format(layout)
 	}
-
 	if _, err := time.Parse(layout, fromDate); err != nil {
 		return "", "", fmt.Errorf("invalid from_date: %w", err)
 	}
 	if _, err := time.Parse(layout, toDate); err != nil {
 		return "", "", fmt.Errorf("invalid to_date: %w", err)
 	}
-
 	return fromDate, toDate, nil
 }
 
@@ -125,14 +127,12 @@ func extractTopKeywords(posts []Post, include, exclude []string, topN int) []Key
 	re := regexp.MustCompile(`[a-zA-Z']+|[\p{Han}]+`)
 	freq := map[string]int{}
 	excludedMap := map[string]bool{}
-
 	for _, w := range exclude {
 		w = strings.ToLower(strings.TrimSpace(w))
 		if w != "" {
 			excludedMap[w] = true
 		}
 	}
-
 	for _, post := range posts {
 		tokens := extractKeywordTokens(post.Content, re)
 		for _, t := range tokens {
@@ -142,19 +142,16 @@ func extractTopKeywords(posts []Post, include, exclude []string, topN int) []Key
 			freq[t]++
 		}
 	}
-
 	items := make([]KeywordCount, 0, len(freq))
 	for k, c := range freq {
 		items = append(items, KeywordCount{Keyword: k, Count: c})
 	}
-
 	sort.Slice(items, func(i, j int) bool {
 		if items[i].Count == items[j].Count {
 			return items[i].Keyword < items[j].Keyword
 		}
 		return items[i].Count > items[j].Count
 	})
-
 	if len(items) > topN {
 		items = items[:topN]
 	}
@@ -164,7 +161,6 @@ func extractTopKeywords(posts []Post, include, exclude []string, topN int) []Key
 func extractKeywordTokens(content string, re *regexp.Regexp) []string {
 	matches := re.FindAllString(strings.ToLower(content), -1)
 	tokens := make([]string, 0, len(matches)*2)
-
 	for _, m := range matches {
 		if isHanOnly(m) {
 			tokens = append(tokens, hanBigrams(m)...)
@@ -172,7 +168,6 @@ func extractKeywordTokens(content string, re *regexp.Regexp) []string {
 		}
 		tokens = append(tokens, m)
 	}
-
 	return tokens
 }
 
@@ -196,7 +191,6 @@ func hanBigrams(text string) []string {
 	if len(runes) == 2 {
 		return []string{text}
 	}
-
 	bigrams := make([]string, 0, len(runes)-1)
 	for i := 0; i < len(runes)-1; i++ {
 		bigrams = append(bigrams, string(runes[i:i+2]))
@@ -218,13 +212,11 @@ func buildTrends(posts []Post) []TrendPoint {
 			counts[p.CreatedAt[:10]]++
 		}
 	}
-
 	keys := make([]string, 0, len(counts))
 	for k := range counts {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-
 	trends := make([]TrendPoint, 0, len(keys))
 	for _, d := range keys {
 		trends = append(trends, TrendPoint{Date: d, Count: counts[d]})
@@ -237,14 +229,12 @@ func fetchFilteredPosts(db *sql.DB, req StatsRequest) ([]Post, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	rows, err := db.Query(
-		`SELECT id, platform, author, content, created_at
+		`SELECT id, platform, author, content, created_at, COALESCE(sentiment, '') as sentiment
 		 FROM posts
 		 WHERE date(created_at) BETWEEN date(?) AND date(?)
 		 ORDER BY datetime(created_at) DESC`,
-		fromDate,
-		toDate,
+		fromDate, toDate,
 	)
 	if err != nil {
 		return nil, err
@@ -254,10 +244,9 @@ func fetchFilteredPosts(db *sql.DB, req StatsRequest) ([]Post, error) {
 	posts := []Post{}
 	for rows.Next() {
 		var p Post
-		if err := rows.Scan(&p.ID, &p.Platform, &p.Author, &p.Content, &p.CreatedAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.Platform, &p.Author, &p.Content, &p.CreatedAt, &p.Sentiment); err != nil {
 			return nil, err
 		}
-
 		if !containsAny(p.Content, req.IncludeKeywords) {
 			continue
 		}
@@ -273,8 +262,27 @@ func fetchFilteredPosts(db *sql.DB, req StatsRequest) ([]Post, error) {
 	if len(posts) > req.PostLimit {
 		posts = posts[:req.PostLimit]
 	}
-
 	return posts, nil
+}
+
+func computeSentimentPercentage(posts []Post) (map[string]float64, bool) {
+	total := len(posts)
+	if total == 0 {
+		return nil, false
+	}
+	counts := map[string]int{"positive": 0, "neutral": 0, "negative": 0}
+	for _, p := range posts {
+		if p.Sentiment == "" {
+			return nil, false // not all precomputed
+		}
+		counts[p.Sentiment]++
+	}
+	pct := map[string]float64{
+		"positive": math.Round(float64(counts["positive"])/float64(total)*100*100) / 100,
+		"neutral":  math.Round(float64(counts["neutral"])/float64(total)*100*100) / 100,
+		"negative": math.Round(float64(counts["negative"])/float64(total)*100*100) / 100,
+	}
+	return pct, true
 }
 
 func setupDatabase(db *sql.DB) error {
@@ -287,7 +295,12 @@ func setupDatabase(db *sql.DB) error {
 			created_at TEXT NOT NULL
 		)
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	// Add sentiment column if not exists (idempotent migration)
+	db.Exec(`ALTER TABLE posts ADD COLUMN sentiment TEXT DEFAULT NULL`)
+	return nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload interface{}) {
@@ -341,24 +354,20 @@ func main() {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
 		}
-
 		var req StatsRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 			return
 		}
-
 		posts, err := fetchFilteredPosts(db, req)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-
 		exampleLimit := req.ExampleLimit
 		if exampleLimit <= 0 {
 			exampleLimit = 5
 		}
-
 		examplePosts := posts
 		if len(examplePosts) > exampleLimit {
 			examplePosts = examplePosts[:exampleLimit]
@@ -371,6 +380,13 @@ func main() {
 			ExamplePosts: examplePosts,
 			Posts:        posts,
 		}
+
+		// Use precomputed sentiment if available for all posts
+		if pct, ok := computeSentimentPercentage(posts); ok {
+			resp.SentimentPrecomputed = true
+			resp.SentimentPercentage = pct
+		}
+
 		writeJSON(w, http.StatusOK, resp)
 	})
 
@@ -379,46 +395,43 @@ func main() {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
 		}
-
 		var req InsertPostRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 			return
 		}
-
 		req.Platform = strings.TrimSpace(req.Platform)
 		req.Author = strings.TrimSpace(req.Author)
 		req.Content = strings.TrimSpace(req.Content)
-
 		if req.Platform == "" || req.Author == "" || req.Content == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "platform, author, and content are required"})
 			return
 		}
-
 		createdAt, err := normalizeCreatedAt(req.CreatedAt)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-
+		sentiment := strings.TrimSpace(req.Sentiment)
+		var sentimentVal interface{}
+		if sentiment != "" {
+			sentimentVal = sentiment
+		} else {
+			sentimentVal = nil
+		}
 		result, err := db.Exec(
-			`INSERT INTO posts (platform, author, content, created_at) VALUES (?, ?, ?, ?)`,
-			req.Platform,
-			req.Author,
-			req.Content,
-			createdAt,
+			`INSERT INTO posts (platform, author, content, created_at, sentiment) VALUES (?, ?, ?, ?, ?)`,
+			req.Platform, req.Author, req.Content, createdAt, sentimentVal,
 		)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to insert post"})
 			return
 		}
-
 		id64, err := result.LastInsertId()
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to retrieve inserted id"})
 			return
 		}
-
 		writeJSON(w, http.StatusCreated, InsertPostResponse{ID: int(id64)})
 	})
 
