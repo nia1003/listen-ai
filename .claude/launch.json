@@ -1,0 +1,41 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "frontend",
+      "runtimeExecutable": "/Users/nia/listen-ai/frontend/.venv/bin/streamlit",
+      "runtimeArgs": ["run", "frontend/app.py", "--server.port=8501", "--server.address=0.0.0.0"],
+      "port": 8501,
+      "autoPort": false
+    },
+    {
+      "name": "gateway",
+      "runtimeExecutable": "/Users/nia/.nvm/versions/node/v24.14.0/bin/node",
+      "runtimeArgs": ["gateway/src/index.js"],
+      "port": 8000,
+      "autoPort": false,
+      "env": {
+        "GATEWAY_PORT": "8000",
+        "STAT_URL": "http://localhost:8002",
+        "NLP_URL": "http://localhost:8001",
+        "JWT_SECRET": "supersecret",
+        "DEMO_USER": "admin",
+        "DEMO_PASS": "admin123"
+      }
+    },
+    {
+      "name": "nlp",
+      "runtimeExecutable": "/bin/bash",
+      "runtimeArgs": ["-c", "cd nlp && ../.venv-nlp/bin/uvicorn app:app --host 0.0.0.0 --port 8001"],
+      "port": 8001,
+      "autoPort": false
+    },
+    {
+      "name": "stat",
+      "runtimeExecutable": "/bin/bash",
+      "runtimeArgs": ["-c", "cd stat && STAT_PORT=8002 SQLITE_PATH=../data/listenai.db /opt/homebrew/bin/go run ."],
+      "port": 8002,
+      "autoPort": false
+    }
+  ]
+}
