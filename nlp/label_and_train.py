@@ -245,18 +245,25 @@ def main():
     joblib.dump(pipeline, MODEL_PATH)
     print(f"\nModel saved → {MODEL_PATH}")
 
+    # ── Step 4b: Evaluate OLD algorithm on the SAME test set (fair comparison) ──
+    print("\n" + "=" * 60)
+    print("Evaluating OLD algorithm on the SAME test set (N=942) for fair comparison")
+    old_preds_test = [classify_old(t) for t in X_test]
+    old_acc_test = accuracy_score(y_test, old_preds_test)
+    old_macro_f1_test = f1_score(y_test, old_preds_test, average="macro", zero_division=0)
+    old_per_class_test = classification_report(y_test, old_preds_test, zero_division=0)
+    print(f"\n  Accuracy : {old_acc_test:.4f}")
+    print(f"  Macro F1 : {old_macro_f1_test:.4f}")
+    print("\nPer-class report (old, test set):")
+    print(old_per_class_test)
+
     # ── Step 5: Comparison table ──────────────────────────────────
     print("\n" + "=" * 60)
-    print("COMPARISON TABLE")
-    print(f"{'Method':<30} {'Accuracy':>10} {'Macro F1':>10}")
-    print("-" * 52)
-    print(f"{'Old (small lexicon)  [all]':<30} {old_acc:>10.4f} {old_macro_f1:>10.4f}")
-    # Evaluate new model on full dataset for a fair comparison
-    new_preds_all = pipeline.predict(texts)
-    new_acc_all = accuracy_score(labels, new_preds_all)
-    new_macro_f1_all = f1_score(labels, new_preds_all, average="macro", zero_division=0)
-    print(f"{'New (TF-IDF + LogReg)[all]':<30} {new_acc_all:>10.4f} {new_macro_f1_all:>10.4f}")
-    print(f"{'New (TF-IDF + LogReg)[test]':<30} {new_acc:>10.4f} {new_macro_f1:>10.4f}")
+    print("COMPARISON TABLE (all on same N=942 test set)")
+    print(f"{'Method':<35} {'Accuracy':>10} {'Macro F1':>10}")
+    print("-" * 57)
+    print(f"{'Old lexicon  [test set]':<35} {old_acc_test:>10.4f} {old_macro_f1_test:>10.4f}")
+    print(f"{'TF-IDF+LogReg [test set]':<35} {new_acc:>10.4f} {new_macro_f1:>10.4f}")
 
     # ── Step 6: Inference timing ──────────────────────────────────
     print("\n" + "=" * 60)
